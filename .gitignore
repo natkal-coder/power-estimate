@@ -1,0 +1,8 @@
+power_log.csv
+__pycache__/
+.claude/
+.mypy_cache/
+.ruff_cache/
+power_config.json
+power-log.service
+power-applet.desktop
