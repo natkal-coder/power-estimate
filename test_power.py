@@ -9,6 +9,7 @@ from datetime import date
 from pathlib import Path
 
 import power as P
+from tariffs import EUR, regional_rate
 
 SG = {"psu_w": 1000, "overhead_w": 50, "tariff": 0.5, "currency": "S$"}
 flat = P.wall_fn(SG, 0.8)  # 200 W DC -> 250 W wall
@@ -127,7 +128,29 @@ long_run = {f"2026-11-{n:02d}": day(n) for n in range(1, 21)}
 assert P.week_kwh_per_day(long_run, date(2026, 11, 20)) == (16, 7)  # mean of 13..19
 
 
-# Setup: rate defaults only in Singapore, bad input refused with a message
+# Region: timezone to country to rate; every table entry is a real zone.tab country
+zone = root / "zone.tab"
+zone.write_text("# comment\nDE\t+5230+01322\tEurope/Berlin\tmost\nSG\t+0117+10351\tAsia/Singapore\n")
+assert P.country_code("Europe/Berlin", zone) == "DE"
+assert P.country_code("Mars/Base", zone) is None
+assert P.country_code("Asia/Singapore", root / "no-such-tab") is None
+zi = root / "usr/share/zoneinfo/Asia"
+write(zi / "Tokyo", "")
+(root / "link").symlink_to(zi / "Tokyo")
+assert P.system_timezone(root / "link") == "Asia/Tokyo"
+write(root / "plain", "")
+write(root / "tzname", "Europe/Paris\n")
+assert P.system_timezone(root / "plain", root / "tzname") == "Europe/Paris"
+assert P.system_timezone(root / "plain", root / "nope") is None
+assert regional_rate("GR")[1] == "€" and regional_rate("EL") is None  # zone.tab uses GR
+assert regional_rate("SG") == (0.3116, "S$") and regional_rate("GB")[1] == "£"
+assert regional_rate("JP") is None and regional_rate(None) is None
+assert all(0.05 < rate < 0.5 for rate in EUR.values())
+tab = P.ZONE_TAB.read_text() if P.ZONE_TAB.exists() else ""
+assert not tab or all(f"\n{c}\t" in tab for c in list(EUR) + ["SG", "US", "GB"])
+
+
+# Setup: region default, your own rate wins, bad input refused with a message
 def refused(**kw):
     try:
         P.write_config(path=root / "bad.json", **kw)
@@ -137,13 +160,19 @@ def refused(**kw):
 
 
 cfg_path = root / "cfg.json"
-c = P.write_config(1300, None, None, 61, cfg_path, singapore=True)
-assert c == {"psu_w": 1300, "overhead_w": 61, "tariff": P.SG_TARIFF, "currency": "S$"}
+c = P.write_config(1300, None, None, 61, cfg_path, country="SG")
+assert c == {"psu_w": 1300, "overhead_w": 61, "tariff": 0.3116, "currency": "S$",
+             "rate_source": "national average for SG"}
 assert json.loads(cfg_path.read_text()) == c == P.load_config(cfg_path)
-assert P.write_config(850, 0.2, None, 50, cfg_path, singapore=False)["currency"] == "$"
-assert refused(psu_w=850, tariff=None, currency=None, overhead_w=50, singapore=False)
-assert refused(psu_w=0, tariff=0.2, currency=None, overhead_w=50, singapore=False)
-assert refused(psu_w=850, tariff=-1, currency=None, overhead_w=50, singapore=False)
+de = P.write_config(850, None, None, 50, cfg_path, country="DE")
+assert de["tariff"] == EUR["DE"] and de["currency"] == "€"
+mine = P.write_config(850, 0.2, None, 50, cfg_path, country="DE")
+assert mine["tariff"] == 0.2 and mine["currency"] == "€" and mine["rate_source"] == "user"
+assert P.write_config(850, 0.2, None, 50, cfg_path, country="JP")["currency"] == "$"
+assert P.write_config(850, 30.0, "¥", 50, cfg_path, country="JP")["currency"] == "¥"
+assert refused(psu_w=850, tariff=None, currency=None, overhead_w=50, country="JP")
+assert refused(psu_w=0, tariff=0.2, currency=None, overhead_w=50, country="JP")
+assert refused(psu_w=850, tariff=-1, currency=None, overhead_w=50, country="JP")
 try:
     P.load_config(root / "missing.json")
     raise AssertionError("missing config accepted")

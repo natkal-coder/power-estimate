@@ -1,5 +1,6 @@
 #!/bin/sh
 # Usage: ./install.sh --psu-w 1300 [--tariff 0.31] [--currency '$']
+# --tariff is needed where no open national rate is held for your timezone.
 set -eu
 DIR=$(cd "$(dirname "$0")" && pwd)
 PY=/usr/bin/python3

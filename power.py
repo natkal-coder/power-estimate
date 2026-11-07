@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Estimate a desktop PC's wall power and electricity cost on Linux.
 
-  power.py setup --psu-w 1300 [--tariff 0.31] [--currency S$]
+  power.py setup --psu-w 1300 [--tariff 0.31] [--currency $]
   power.py log      sample forever, append raw watts to power_log.csv
   power.py report   energy, cost, month estimate (--tariff --psu-eff --overhead)
 
 GPU (NVIDIA, AMD) and CPU (RAPL) are measured. Board, RAM, disks, fans and PSU
 losses are estimated. Raw readings are logged and the estimates apply at report
 time, so changing them reprices all history. Monitors are not included.
+The default rate comes from the system timezone's country where an open national
+average exists; everywhere else, pass --tariff.
 """
 import argparse
 import calendar
@@ -22,6 +24,8 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
+from tariffs import regional_rate
+
 HERE = Path(__file__).resolve().parent
 LOG = HERE / "power_log.csv"
 CONFIG = HERE / "power_config.json"
@@ -29,13 +33,14 @@ POWERCAP = Path("/sys/class/powercap")
 DRM = Path("/sys/class/drm")
 BLOCK = Path("/sys/block")
 LOCALTIME = Path("/etc/localtime")
+TIMEZONE = Path("/etc/timezone")
+ZONE_TAB = Path("/usr/share/zoneinfo/zone.tab")
 
 INTERVAL_S = 15
 MAX_GAP_S = INTERVAL_S * 3  # longer gap = PC off or logger down: not billed
 DAY_FMT, MONTH_FMT = "%Y-%m-%d", "%Y-%m"
 WEEK_DAYS = 7
 
-SG_TARIFF = 0.3116  # S$/kWh, SP Group with GST, 1 Oct-31 Dec 2026
 MAX_PSU_W = 5000
 
 # Typical draw of parts nothing measures. Calibrate with a wall meter.
@@ -243,22 +248,44 @@ def week_kwh_per_day(days, today):
     return kwh / len(full), len(full)
 
 
-def in_singapore(localtime=LOCALTIME):
-    return str(localtime.resolve()).endswith("/Singapore")
+def system_timezone(localtime=LOCALTIME, timezone=TIMEZONE):
+    """Timezone name from the /etc/localtime link, else /etc/timezone. May be None."""
+    resolved = str(localtime.resolve())
+    if "zoneinfo/" in resolved:
+        return resolved.split("zoneinfo/", 1)[1]
+    try:
+        return timezone.read_text().strip() or None
+    except OSError:
+        return None
 
 
-def write_config(psu_w, tariff, currency, overhead_w, path=None, singapore=None):
+def country_code(tz, zone_tab=ZONE_TAB):
+    """ISO country for a timezone name, or None if unknown."""
+    try:
+        lines = zone_tab.read_text().split("\n")
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.split("\t")
+        if not line.startswith("#") and len(fields) >= 3 and fields[2] == tz:
+            return fields[0]
+    return None
+
+
+def write_config(psu_w, tariff, currency, overhead_w, path=None, country=None):
     """Validate setup input and save it. Exits with a message on bad input."""
-    singapore = in_singapore() if singapore is None else singapore
+    code = country_code(system_timezone()) if country is None else country
+    region = regional_rate(code)
     if not 0 < psu_w <= MAX_PSU_W:
         sys.exit(f"--psu-w must be between 1 and {MAX_PSU_W}")
-    if tariff is None and not singapore:
-        sys.exit("no default rate outside Singapore: pass --tariff, your price per kWh")
-    tariff = SG_TARIFF if tariff is None else tariff
-    if tariff <= 0:
+    if tariff is None and region is None:
+        sys.exit(f"no open rate for region {code}: pass --tariff, your price per kWh")
+    rate = region[0] if tariff is None else tariff
+    if rate <= 0:
         sys.exit("--tariff must be above 0")
-    cfg = {"psu_w": psu_w, "overhead_w": overhead_w, "tariff": tariff,
-           "currency": currency or ("S$" if singapore else "$")}
+    symbol = currency or (region[1] if region else "$")
+    cfg = {"psu_w": psu_w, "overhead_w": overhead_w, "tariff": rate, "currency": symbol,
+           "rate_source": f"national average for {code}" if tariff is None else "user"}
     (path or CONFIG).write_text(json.dumps(cfg, indent=2) + "\n")
     return cfg
 
