@@ -4,6 +4,7 @@
   power.py setup --psu-w 1300 [--tariff 0.31] [--currency $]
   power.py log      sample forever, append raw watts to power_log.csv
   power.py report   energy, cost, month estimate (--tariff --psu-eff --overhead)
+  power.py plot     charts in power_report.html, opened in your browser
 
 GPU (NVIDIA, AMD) and CPU (RAPL) are measured. Board, RAM, disks, fans and PSU
 losses are estimated. Raw readings are logged and the estimates apply at report
@@ -28,6 +29,7 @@ from tariffs import regional_rate
 
 HERE = Path(__file__).resolve().parent
 LOG = HERE / "power_log.csv"
+REPORT_HTML = HERE / "power_report.html"
 CONFIG = HERE / "power_config.json"
 POWERCAP = Path("/sys/class/powercap")
 DRM = Path("/sys/class/drm")
@@ -297,7 +299,8 @@ def load_config(path=None):
         sys.exit("no valid power_config.json: run install.sh --psu-w <your PSU watts>")
 
 
-def report(args, log=None, config=None):
+def load_context(args, log=None, config=None):
+    """Rows and pricing for report and plot, with command-line overrides applied."""
     cfg = load_config(config)
     path = log or LOG
     if not path.exists():
@@ -306,8 +309,42 @@ def report(args, log=None, config=None):
         rows = load_rows(f)
     overhead = cfg["overhead_w"] if args.overhead is None else args.overhead
     tariff = cfg["tariff"] if args.tariff is None else args.tariff
-    cur = cfg["currency"]
-    to_wall = wall_fn(cfg, args.psu_eff)
+    return rows, overhead, tariff, cfg["currency"], wall_fn(cfg, args.psu_eff)
+
+
+def month_estimate(days, today):
+    """(kWh per day, full days used, days in this month), or None."""
+    week = week_kwh_per_day(days, today)
+    if week is None:
+        return None
+    return week[0], week[1], calendar.monthrange(today.year, today.month)[1]
+
+
+def plot(args, log=None, config=None, out=None):
+    import plot as charts
+    rows, overhead, tariff, cur, to_wall = load_context(args, log, config)
+    if summarize(rows, overhead, to_wall) is None:
+        sys.exit("not enough samples yet")
+    now = time.time()
+    days = totals(rows, overhead, to_wall, DAY_FMT)
+    month = totals(rows, overhead, to_wall, MONTH_FMT).get(time.strftime(MONTH_FMT), {"kwh": 0.0})
+    est = month_estimate(days, date.today())
+    week = charts.buckets(rows, overhead, to_wall, now - charts.POWER_DAYS * 86400)
+    avg_w = sum(p["gpu"] + p["cpu"] + p["other"] for p in week) / len(week) if week else 0
+    stats = [(f"{date.today():%B} so far", f"{cur}{month['kwh'] * tariff:.2f}"),
+             ("estimate for the full month",
+              f"{cur}{est[0] * est[2] * tariff:.0f}" if est else "needs a full day"),
+             (f"average at the wall, last {charts.POWER_DAYS} days", f"{avg_w:.0f} W")]
+    html_text = charts.page(stats, days, rows, overhead, to_wall, tariff, cur,
+                            est[0] if est else None, now)
+    path = out or REPORT_HTML
+    path.write_text(html_text, encoding="utf-8")
+    print(f"wrote {path}")
+    return path
+
+
+def report(args, log=None, config=None):
+    rows, overhead, tariff, cur, to_wall = load_context(args, log, config)
     s = summarize(rows, overhead, to_wall)
     if s is None:
         sys.exit("not enough samples yet")
@@ -323,12 +360,11 @@ def report(args, log=None, config=None):
         print(f"{day}  {d['kwh']:.1f} kWh, {cur}{d['kwh'] * tariff:.2f}, "
               f"{d['covered_h']:.1f} h logged")
     today = date.today()
-    week = week_kwh_per_day(days, today)
-    if week is None:
+    est = month_estimate(days, today)
+    if est is None:
         print("estimate needs one full day of logging")
     else:
-        kwh_day, n = week
-        month_days = calendar.monthrange(today.year, today.month)[1]
+        kwh_day, n, month_days = est
         print(f"estimate {kwh_day:.1f} kWh/day over last {n} of {WEEK_DAYS} full days = "
               f"{cur}{kwh_day * month_days * tariff:.2f} for a full "
               f"{today:%B} ({month_days} days)")
@@ -342,7 +378,8 @@ def report(args, log=None, config=None):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", choices=["setup", "log", "report"])
+    p.add_argument("cmd", choices=["setup", "log", "report", "plot"])
+    p.add_argument("--no-open", action="store_true", help="plot: do not open a browser")
     p.add_argument("--psu-w", type=float, help="PSU rating in watts (setup)")
     p.add_argument("--currency", help="symbol for reports (setup)")
     p.add_argument("--tariff", type=float, help="price per kWh")
@@ -363,6 +400,11 @@ def main():
         print(json.dumps(write_config(args.psu_w, args.tariff, args.currency, overhead)))
     elif args.cmd == "log":
         log_forever()
+    elif args.cmd == "plot":
+        path = plot(args)
+        if not args.no_open:
+            import webbrowser
+            webbrowser.open(path.as_uri())
     else:
         report(args)
 

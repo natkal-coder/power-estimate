@@ -6,3 +6,4 @@ __pycache__/
 power_config.json
 power-log.service
 power-applet.desktop
+power_report.html
